@@ -1,0 +1,49 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "LARPBurner",
+      "constructorArgs": [
+        "0x000000000004444c5dc75cB358380D2e3dE08A90",
+        "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7",
+        "10000",
+        "60",
+        "0xc6C965Bd164c483e87d0B550671798e9A3602840",
+        "10000",
+        "200",
+        "0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F",
+        "0",
+        "60",
+        "0x667f4621030aCfAfb1bD0B64d33610A8567f2A44"
+      ]
+    },
+    {
+      "contract": "LARP",
+      "constructorArgs": [
+        "0x0000eC93127BAA929E58E97dd0095A2BFb38ec1D"
+      ]
+    },
+    {
+      "contract": "IMDNames",
+      "constructorArgs": [
+        "0x0000eC93127BAA929E58E97dd0095A2BFb38ec1D",
+        "$contract:LARP",
+        "$contract:LARPBurner",
+        "0x35dA9C0303507ddf708E87F2568EdDf12c47a059",
+        "0xa43e6F75ee006411F79Ac1C84120606C2330DE82",
+        "0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982"
+      ]
+    },
+    {
+      "contract": "LARPLinks",
+      "constructorArgs": [
+        "0x0000eC93127BAA929E58E97dd0095A2BFb38ec1D",
+        "0xfF03410d0Fe5fa8f7F59F743de35E333D9857120",
+        "$contract:LARP",
+        "$contract:IMDNames",
+        "$contract:LARPBurner"
+      ]
+    }
+  ],
+  "notes": "LARP (Linked Avatar Registry Protocol) on Ethereum, four contracts, no owner and no upgrade path. LARPBurner(poolManager, imd, pool4Fee, pool4Spacing, pool4Hook, backupFee, backupSpacing, imd6900, pairFee, pairSpacing, pairHook): burns ETH into $IMD through Uniswap v4's PoolManager (0x0000...8A90), buying $IMD (0xD34a...63B7) on the POOL4 pool (fee 10000, spacing 60, hook 0xc6C9...2840), falling back to the hookless backup pool (fee 10000, spacing 200), and the IMD6900 (0x0000198C...7d2F) pair (fee 0, spacing 60, hook 0x667f...2A44); the three tick spacings are uint24 arguments stored as int24 (commit 0b0e260); out-of-gas swaps revert. LARP(identity): the avatar registry over identity.md (0x0000eC93...ec1D), agents, faces and equipped items. IMDNames(identity, larp, burner, artist, intake, oracleSigner): the IMD Names ERC-721 collection with 10x cheaper prices (short 0.0069, four 0.00169, long 0.00069, crew 0.00069 ETH) that change only by the IMD swarm's verdict within the guardrails: anyone proposes through IMD's oracle Intake (0xa43e...DE82), the oracle signer (0x5598...2982) delivers the verdict, anyone executes; royalties go to LARPBurner; artist 0x35dA...a059 only names the renderer and the next artist until the renderer is locked. LARPLinks(identity, launcher, larp, names, burner): frens, crews and launch jeet ranks, reading IMD's launcher (0xfF03...7120) and the three earlier contracts. Constructors call nothing; no CALLCODE, DELEGATECALL or SELFDESTRUCT; deploys in one transaction. No token, pool, ETH funding or initialization call."
+}
