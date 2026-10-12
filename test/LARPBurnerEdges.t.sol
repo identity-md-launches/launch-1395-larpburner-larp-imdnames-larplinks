@@ -4,12 +4,35 @@ pragma solidity ^0.8.26;
 import {Base} from "./Base.sol";
 import {LARPBurner} from "../src/LARPBurner.sol";
 import {RangeAdder} from "./LARPBurner.invariant.t.sol";
+import {MockWETH} from "./LARPBurner.t.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolIdLibrary, PoolKey as V4PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
-/// @dev The burner at its edges: the constructor's refusals, its constants, one wei, exactly MAX_BURN, a partial fill,
-/// pools that don't exist, and the arithmetic of the share, fuzzed.
+/// @dev WETH that reports a balance for everyone and refuses every withdrawal.
+contract StuckWETH {
+    function balanceOf(address) external pure returns (uint256) {
+        return 1 ether;
+    }
+
+    function withdraw(uint256) external pure {
+        revert("stuck");
+    }
+}
+
+/// @dev WETH whose every answer is 16 bytes long.
+contract ShortWETH {
+    fallback() external payable {
+        assembly {
+            mstore(0, 0)
+            return(0, 0x10)
+        }
+    }
+}
+
+/// @dev The burner at its edges: the constructor's refusals, its constants, one wei, exactly MAX_BURN, the block's
+/// allowance for waiting ETH, the gas budget, WETH that misbehaves, a partial fill, pools that don't exist, and the
+/// arithmetic of the share, fuzzed.
 contract LARPBurnerEdgesTest is Base {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for V4PoolKey;
@@ -81,10 +104,168 @@ contract LARPBurnerEdgesTest is Base {
         emit Bought(0.1 ether, 0, 0);
         burner.burn(0);
         assertEq(address(burner).balance, 0);
-        // one wei over MAX_BURN: the wei stays
+        // one wei over MAX_BURN, in the same block: the block's MAX_BURN of waiting ETH is already spent, so nothing
+        // sells (and nothing parks: there was nothing to sell)
         vm.deal(address(burner), 0.1 ether + 1);
+        assertEq(burner.burn(0), 0);
+        assertEq(address(burner).balance, 0.1 ether + 1);
+        // the next block: exactly MAX_BURN again, the wei stays
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.1 ether, 0, 0);
         burner.burn(0);
         assertEq(address(burner).balance, 1);
+    }
+
+    /// @dev The block's allowance is only for ETH that was already waiting: a caller's own ETH (up to MAX_BURN) is
+    /// never counted against it, and what the caller's own ETH leaves of the call's cap is what the waiting ETH gets.
+    function test_TheBlockAllowanceCountsOnlyTheWaitingEth() public {
+        _fillPool4();
+        vm.deal(address(burner), 0.3 ether); // royalties waiting
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.1 ether, 0, 0);
+        burner.burn{value: 0.05 ether}(0); // 0.05 own + 0.05 waiting
+        assertEq(address(burner).balance, 0.25 ether);
+        // the block has 0.05 of its allowance left for the waiting ETH
+        vm.prank(carol);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.05 ether, 0, 0);
+        burner.burn(0);
+        assertEq(address(burner).balance, 0.2 ether);
+        // and then none, however many calls, while a fee still goes through whole
+        assertEq(burner.burn(0), 0);
+        assertEq(address(burner).balance, 0.2 ether);
+        vm.deal(bob, 1 ether);
+        vm.prank(bob);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.1 ether, 0, 0);
+        burner.burn{value: 0.1 ether}(0);
+        assertEq(address(burner).balance, 0.2 ether, "bob's own 0.1 went, nothing of the waiting ETH");
+        // a fee above the cap: the excess joins the waiting ETH
+        vm.prank(bob);
+        burner.burn{value: 0.12 ether}(0);
+        assertEq(address(burner).balance, 0.22 ether);
+    }
+
+    /// forge-config: default.fuzz.runs = 192
+    /// @dev Two burns in one block, from the NatSpec: a caller's own ETH (up to MAX_BURN) always goes through, no
+    /// call spends more than MAX_BURN, no more than MAX_BURN of the waiting ETH leaves in the block, and every wei
+    /// that leaves lands in the PoolManager.
+    function testFuzz_TwoBurnsInOneBlockSellAtMostOneCapOfWaitingEth(uint256 waiting, uint256 v1, uint256 v2) public {
+        _fillPool4();
+        _fillPair();
+        waiting = bound(waiting, 1e12, 0.5 ether);
+        v1 = bound(v1, 0, 0.3 ether);
+        v2 = bound(v2, 0, 0.3 ether);
+        vm.deal(address(burner), waiting);
+        vm.deal(address(this), v1 + v2);
+        uint256 pmBefore = address(pm).balance;
+        uint256 max = burner.MAX_BURN();
+
+        uint256 before = address(burner).balance + v1;
+        burner.burn{value: v1}(0);
+        uint256 sold1 = before - address(burner).balance;
+        assertGe(sold1, v1 < max ? v1 : max, "the first caller's own ETH goes through");
+        assertLe(sold1, max, "no call spends more than MAX_BURN");
+        uint256 fromWaiting = sold1 - (v1 < max ? v1 : max);
+
+        before = address(burner).balance + v2;
+        burner.burn{value: v2}(0);
+        uint256 sold2 = before - address(burner).balance;
+        assertGe(sold2, v2 < max ? v2 : max, "the second caller's own ETH goes through");
+        assertLe(sold2, max, "no call spends more than MAX_BURN");
+        fromWaiting += sold2 - (v2 < max ? v2 : max);
+
+        assertLe(fromWaiting, max, "at most MAX_BURN of the waiting ETH leaves per block");
+        assertEq(address(pm).balance - pmBefore, sold1 + sold2, "ETH leaves only into the PoolManager");
+        assertEq(address(burner).balance, waiting + v1 + v2 - sold1 - sold2);
+        assertEq(imd.balanceOf(address(burner)), 0, "no $IMD stays");
+    }
+
+    // --- the gas budget at its edges ---
+
+    /// @dev A leg that runs third-party code gets a fixed 3M budget, and a call that can't fund it is refused before
+    /// the leg runs: with ETH to sell, or with enough $IMD for a share, a 1M-gas call reverts TooLittleGas and moves
+    /// nothing. With nothing to sell and no share to buy, no leg runs and no budget is needed.
+    function test_BelowTheLegBudgetABurnIsRefusedBeforeAnyLegRuns() public {
+        _fillPool4();
+        _fillPair();
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        (bool ok, bytes memory err) =
+            address(burner).call{value: 0.05 ether, gas: 1_000_000}(abi.encodeCall(burner.burn, (0)));
+        assertFalse(ok);
+        assertEq(bytes4(err), LARPBurner.TooLittleGas.selector);
+        assertEq(address(burner).balance, 0, "a refused burn keeps nothing of the fee");
+        assertEq(alice.balance, 1 ether);
+        assertEq(imd.balanceOf(DEAD), 0);
+
+        // nothing to sell, nothing held: the call does nothing and needs no budget
+        (ok,) = address(burner).call{gas: 150_000}(abi.encodeCall(burner.burn, (0)));
+        assertTrue(ok, "an empty burn runs no leg");
+
+        // 14 wei of $IMD: the share rounds to 0, so no leg runs and 150k gas burns it all to DEAD
+        imd.mint(address(burner), 14);
+        (ok,) = address(burner).call{gas: 150_000}(abi.encodeCall(burner.burnImd, ()));
+        assertTrue(ok, "no share, no leg, no budget");
+        assertEq(imd.balanceOf(DEAD), 14);
+        assertEq(imd.balanceOf(address(burner)), 0);
+
+        // 15 wei: a share of 1 wei needs the IMD6900 leg, which needs its budget
+        imd.mint(address(burner), 15);
+        (ok, err) = address(burner).call{gas: 1_000_000}(abi.encodeCall(burner.burnImd, ()));
+        assertFalse(ok);
+        assertEq(bytes4(err), LARPBurner.TooLittleGas.selector);
+        assertEq(imd.balanceOf(address(burner)), 15, "refused: nothing moved");
+        burner.burnImd(); // with gas to spare it goes
+        assertEq(imd.balanceOf(address(burner)), 0);
+    }
+
+    // --- WETH that does not behave ---
+
+    /// @dev WETH that reports a balance but refuses to unwrap it: the burn goes on with the ETH it has, and the WETH
+    /// stays where it is.
+    function test_AWethThatRefusesToUnwrapIsIgnored() public {
+        _fillPool4();
+        address weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        vm.etch(weth, address(new StuckWETH()).code);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.01 ether, 0, 0);
+        assertGt(burner.burn{value: 0.01 ether}(0), 0);
+        assertEq(address(burner).balance, 0);
+        assertEq(StuckWETH(weth).balanceOf(address(burner)), 1 ether, "still there");
+    }
+
+    /// @dev WETH whose `balanceOf` answers fewer than 32 bytes: read as nothing to unwrap.
+    function test_AWethAnsweringShortIsIgnored() public {
+        _fillPool4();
+        address weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        vm.etch(weth, address(new ShortWETH()).code);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.01 ether, 0, 0);
+        assertGt(burner.burn{value: 0.01 ether}(0), 0);
+        assertEq(address(burner).balance, 0);
+    }
+
+    /// @dev Unwrapped WETH is waiting ETH, not the caller's own: it leaves MAX_BURN a block.
+    function test_UnwrappedWethIsWaitingEth() public {
+        _fillPool4();
+        address weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        vm.etch(weth, address(new MockWETH()).code);
+        MockWETH(weth).deposit{value: 0.25 ether}();
+        MockWETH(weth).transfer(address(burner), 0.25 ether);
+        vm.expectEmit(true, false, true, false, address(burner));
+        emit Bought(0.1 ether, 0, 0);
+        burner.burn(0);
+        assertEq(MockWETH(weth).balanceOf(address(burner)), 0);
+        assertEq(address(burner).balance, 0.15 ether, "unwrapped, MAX_BURN sold");
+        assertEq(burner.burn(0), 0, "the block's allowance is spent");
+        assertEq(address(burner).balance, 0.15 ether);
+        vm.roll(vm.getBlockNumber() + 1);
+        burner.burn(0);
+        assertEq(address(burner).balance, 0.05 ether);
     }
 
     function test_NothingToBurnIsNotAnError() public {

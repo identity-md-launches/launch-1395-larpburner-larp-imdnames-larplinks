@@ -13,6 +13,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {LARPBurner} from "../src/LARPBurner.sol";
 import {MockIMD, MockIMD6900, LiquidityAdder} from "./Base.sol";
+import {MockWETH} from "./LARPBurner.t.sol";
 
 /// @dev Adds liquidity to a v4 pool in one tick range, paid by the caller (the Base adder is full range only).
 contract RangeAdder {
@@ -97,9 +98,10 @@ contract Trader {
     receive() external payable {}
 }
 
-/// @dev Drives the burner at random: ETH and $IMD arrive, anyone burns with any `minImd`, a trader moves POOL4 in and
-/// out of its liquidity range (so routes fail and fall back), and now and then the PoolManager refuses every unlock
-/// (so the ETH parks). Ghost totals record what came in and what the PoolManager received.
+/// @dev Drives the burner at random: ETH, WETH and $IMD arrive, anyone burns with any `minImd`, with gas to spare or
+/// below a leg's budget, blocks pass, a trader moves POOL4 in and out of its liquidity range (so routes fail and fall
+/// back), and now and then the PoolManager refuses every unlock (so the ETH parks). Ghost totals record what came in
+/// and what the PoolManager received; a model of the block's allowance for waiting ETH says what each call may sell.
 contract BurnerHandler is Test {
     address constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
@@ -108,12 +110,13 @@ contract BurnerHandler is Test {
     MockIMD6900 public imd6900;
     PoolManager public pm;
     Trader public trader;
+    MockWETH public weth;
     V4PoolKey public pool4;
     V4PoolKey public backup;
     V4PoolKey public pair;
 
     // --- ghosts ---
-    uint256 public ethIn; // ETH that arrived at the burner (donations and burn values that went through)
+    uint256 public ethIn; // ETH that arrived at the burner (donations, WETH donations and burn values that went through)
     uint256 public ethToPm; // ETH the PoolManager gained during the burner's calls
     uint256 public imdIn; // $IMD minted straight to the burner
     uint256 public imdFromPm; // $IMD the burner bought (burn's return values)
@@ -125,6 +128,14 @@ contract BurnerHandler is Test {
     uint256 public parked;
     uint256 public fellBack;
     uint256 public refused;
+    uint256 public refusedForGas;
+    uint256 public blocksRolled;
+    // the model of the block's allowance: the block in which waiting ETH was last taken, and how much of it
+    uint256 public modelBlock;
+    uint256 public modelTaken;
+    // measured: the waiting ETH (not the caller's own) that actually left in the current block
+    uint256 public measuredBlock;
+    uint256 public waitingSoldInBlock;
 
     address[3] public callers = [address(0xA11CE), address(0xB0B), address(0xCA401)];
 
@@ -134,6 +145,7 @@ contract BurnerHandler is Test {
         MockIMD6900 imd6900_,
         PoolManager pm_,
         Trader trader_,
+        MockWETH weth_,
         V4PoolKey memory pool4_,
         V4PoolKey memory backup_,
         V4PoolKey memory pair_
@@ -143,6 +155,7 @@ contract BurnerHandler is Test {
         imd6900 = imd6900_;
         pm = pm_;
         trader = trader_;
+        weth = weth_;
         pool4 = pool4_;
         backup = backup_;
         pair = pair_;
@@ -160,11 +173,26 @@ contract BurnerHandler is Test {
         ethIn += amount;
     }
 
+    /// @dev A royalty paid in WETH (an offer accepted on a market): it counts as ETH that arrived, unwrapped on the
+    /// next burn.
+    function donateWeth(uint256 amount) external {
+        amount = bound(amount, 1, 0.5 ether);
+        vm.deal(address(this), amount);
+        weth.deposit{value: amount}();
+        weth.transfer(address(burner), amount);
+        ethIn += amount;
+    }
+
     function donateImd(uint256 amount) external {
         amount = bound(amount, 1, 1_000 ether);
         imd.mint(address(burner), amount);
         imdIn += amount;
         imdSinceLastBurn += amount;
+    }
+
+    function nextBlock(uint8 n) external {
+        vm.roll(vm.getBlockNumber() + bound(n, 1, 3));
+        ++blocksRolled;
     }
 
     function burn(uint256 who, uint256 value, uint256 minImd, bool starve) external {
@@ -175,6 +203,39 @@ contract BurnerHandler is Test {
         if (starve) vm.mockCallRevert(address(pm), abi.encodeWithSelector(IPoolManager.unlock.selector), "closed");
         _burn(caller, value, minImd);
         if (starve) vm.clearMockedCalls();
+    }
+
+    /// @dev A burn with less gas than a third-party leg's budget (3M plus what the call needs around it): whenever a
+    /// leg would run (ETH to sell, or a share of $IMD to spend) it is refused before the leg runs and moves nothing;
+    /// when no leg would run (nothing to sell, under 15 wei of $IMD) it goes through as usual.
+    function burnWithLittleGas(uint256 who, uint256 value, uint256 gas) external {
+        value = bound(value, 0, 0.3 ether);
+        gas = bound(gas, 150_000, 3_150_000);
+        address caller = callers[who % 3];
+        vm.deal(caller, value);
+        uint256 waitingBefore = address(burner).balance + weth.balanceOf(address(burner));
+        uint256 held = imd.balanceOf(address(burner));
+        uint256 pmImd = imd.balanceOf(address(pm));
+        uint256 supply = imd6900.totalSupply();
+        (uint256 expectSpend,) = _modelSpend(value, waitingBefore);
+        bool legRuns = expectSpend != 0 || held * burner.POOL_SHARE_BPS() / 10_000 != 0;
+
+        vm.prank(caller);
+        (bool ok, bytes memory err) =
+            address(burner).call{value: value, gas: gas}(abi.encodeCall(burner.burn, (uint256(0))));
+        if (legRuns) {
+            assertFalse(ok, "below the budget, a call that would run a leg is refused");
+            assertEq(bytes4(err), LARPBurner.TooLittleGas.selector, "refused before the leg, by name");
+            assertEq(address(burner).balance, waitingBefore - weth.balanceOf(address(burner)), "no ETH moved");
+            assertEq(imd.balanceOf(address(burner)), held, "no $IMD moved");
+            assertEq(caller.balance, value, "the caller keeps the fee");
+            ++refusedForGas;
+            return;
+        }
+        assertTrue(ok, "with no leg to run, no budget is needed");
+        ++burns;
+        ethIn += value; // value is 0 here, or the model would have a leg to run
+        _afterImdBurn(held, pmImd, supply);
     }
 
     function burnImd(uint256 who) external {
@@ -200,13 +261,27 @@ contract BurnerHandler is Test {
         }
     }
 
+    /// @dev What a burn may sell, from the burner's NatSpec: the caller's own ETH up to MAX_BURN, then of the ETH that
+    /// was already waiting (WETH included, since it is unwrapped first) what is left of the call's cap and of the
+    /// block's allowance for waiting ETH.
+    function _modelSpend(uint256 value, uint256 waiting) internal view returns (uint256 spend, uint256 fromWaiting) {
+        uint256 max = burner.MAX_BURN();
+        uint256 own = value < max ? value : max;
+        uint256 taken = modelBlock == vm.getBlockNumber() ? modelTaken : 0;
+        uint256 room = max - own;
+        if (room > max - taken) room = max - taken;
+        fromWaiting = waiting > room ? room : waiting;
+        spend = own + fromWaiting;
+    }
+
     function _burn(address caller, uint256 value, uint256 minImd) internal {
-        uint256 ethBefore = address(burner).balance + value;
+        uint256 waitingBefore = address(burner).balance + weth.balanceOf(address(burner));
+        uint256 ethBefore = waitingBefore + value;
         uint256 pmEth = address(pm).balance;
         uint256 pmImd = imd.balanceOf(address(pm));
         uint256 held = imd.balanceOf(address(burner));
         uint256 supply = imd6900.totalSupply();
-        uint256 expectSpend = ethBefore > burner.MAX_BURN() ? burner.MAX_BURN() : ethBefore;
+        (uint256 expectSpend, uint256 fromWaiting) = _modelSpend(value, waitingBefore);
 
         vm.recordLogs();
         vm.prank(caller);
@@ -214,22 +289,40 @@ contract BurnerHandler is Test {
         if (!ok) {
             ++refused;
             assertEq(bytes4(err), LARPBurner.TooLittleIMD.selector, "with gas to spare, only minImd refuses a burn");
-            assertEq(address(burner).balance, ethBefore - value, "a refused burn moves no ETH");
+            assertEq(
+                address(burner).balance + weth.balanceOf(address(burner)), waitingBefore, "a refused burn moves no ETH"
+            );
             assertEq(imd.balanceOf(address(burner)), held, "a refused burn moves no IMD");
             return;
         }
         ++burns;
         ethIn += value;
         uint256 bought = abi.decode(err, (uint256));
+        assertEq(weth.balanceOf(address(burner)), 0, "a burn unwraps every WETH first");
         uint256 spent = ethBefore - address(burner).balance;
         uint256 pmGain = address(pm).balance - pmEth;
         assertEq(spent, pmGain, "every wei that leaves the burner lands in the PoolManager");
-        assertTrue(spent == 0 || spent == expectSpend, "the sale is exact (up to MAX_BURN) or nothing");
+        assertTrue(
+            spent == 0 || spent == expectSpend,
+            "the sale is exact (the caller's own ETH plus the block's room for the waiting ETH) or nothing"
+        );
         assertTrue((spent == 0) == (bought == 0), "ETH is spent exactly when IMD is bought");
         assertGe(bought, minImd, "the caller's floor holds");
         ethToPm += spent;
         imdFromPm += bought;
-        if (spent == 0 && ethBefore != 0) ++parked;
+        if (spent == 0 && expectSpend != 0) ++parked;
+        // the block's allowance: the burner books the waiting ETH it took whether or not a route then took the trade
+        if (fromWaiting != 0) {
+            modelTaken = (modelBlock == vm.getBlockNumber() ? modelTaken : 0) + fromWaiting;
+            modelBlock = vm.getBlockNumber();
+        }
+        if (spent != 0) {
+            if (measuredBlock != vm.getBlockNumber()) {
+                measuredBlock = vm.getBlockNumber();
+                waitingSoldInBlock = 0;
+            }
+            waitingSoldInBlock += spent - (expectSpend - fromWaiting);
+        }
         // which route took it, from the Bought event (route 1 is the hookless pool)
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; ++i) {
@@ -267,11 +360,14 @@ contract BurnerHandler is Test {
 contract LARPBurnerInvariantTest is Test {
     address constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
+    address constant WETH9 = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
     MockIMD imd;
     MockIMD6900 imd6900;
     PoolManager pm;
     LARPBurner burner;
     BurnerHandler handler;
+    MockWETH weth;
     V4PoolKey pool4;
     V4PoolKey backup;
     V4PoolKey pair;
@@ -281,6 +377,9 @@ contract LARPBurnerInvariantTest is Test {
     function setUp() public {
         imd = new MockIMD();
         imd6900 = new MockIMD6900();
+        // the burner unwraps WETH9 at its Ethereum address: a mock lives there on this chain
+        vm.etch(WETH9, address(new MockWETH()).code);
+        weth = MockWETH(WETH9);
         pm = new PoolManager(address(this));
         LiquidityAdder adder = new LiquidityAdder(IPoolManager(address(pm)));
         RangeAdder ranged = new RangeAdder(IPoolManager(address(pm)));
@@ -312,15 +411,22 @@ contract LARPBurnerInvariantTest is Test {
         supplyAtStart = imd6900.totalSupply();
         pmEthAtStart = address(pm).balance;
 
-        handler = new BurnerHandler(burner, imd, imd6900, pm, trader, pool4, backup, pair);
+        handler = new BurnerHandler(burner, imd, imd6900, pm, trader, weth, pool4, backup, pair);
         targetContract(address(handler));
     }
 
     receive() external payable {}
 
-    /// @dev ETH only ever leaves the burner as a swap: what arrived equals what it holds plus what the PoolManager got.
+    /// @dev ETH only ever leaves the burner as a swap: what arrived (WETH included) equals what it holds, as ETH or as
+    /// WETH not yet unwrapped, plus what the PoolManager got.
     function invariant_EthLeavesOnlyAsASwap() public view {
-        assertEq(address(burner).balance + handler.ethToPm(), handler.ethIn());
+        assertEq(address(burner).balance + weth.balanceOf(address(burner)) + handler.ethToPm(), handler.ethIn());
+    }
+
+    /// @dev Of the ETH that was already waiting, at most MAX_BURN leaves per block, however many calls (AUDIT.md
+    /// L-10), measured from balances; a caller's own fee is not counted.
+    function invariant_WaitingEthLeavesAtMostOneCapPerBlock() public view {
+        assertLe(handler.waitingSoldInBlock(), burner.MAX_BURN());
     }
 
     /// @dev $IMD is conserved: everything that arrived (minted or bought) is at DEAD, in the pair pool (as the IMD6900
