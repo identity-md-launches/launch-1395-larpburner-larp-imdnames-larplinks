@@ -19,7 +19,9 @@ interface IIntake {
     ) external returns (bytes32 requestId);
 }
 
-/// @dev IMD's OracleAttestation, field for field (the callback selector 0x510379c7 depends on this layout).
+/// @dev IMD's OracleAttestation, field for field: the callback's selector depends on this layout. The callback's name
+/// is the consumer's, only the parameter types are the protocol's: this contract's is `onVerdict`, selector 0x8bf09c1b
+/// (IMD's example `onOracleResult` with the same parameters is 0x510379c7), and `propose` registers that one.
 struct Attestation {
     bytes32 requestId;
     uint256 chainId;

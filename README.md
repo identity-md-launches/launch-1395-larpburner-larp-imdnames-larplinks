@@ -115,7 +115,10 @@ a mainnet fork.
 
 ## The burner (LARPBurner)
 
-`burn(minImd)` spends the ETH waiting, up to 0.1 ETH a call. Anyone can call it, and fees call it on the way in.
+`burn(minImd)` spends the ETH waiting, up to 0.1 ETH a call, and of the ETH that was already waiting at most 0.1 ETH a
+block (a caller's own fee always goes through). WETH royalties are unwrapped first. Anyone can call it, and fees call it
+on the way in; a call needs a gas limit of about 3.4M (each leg that runs a hook or IMD6900 gets a fixed 3M budget, so
+nobody can starve it and nothing it calls can halt it).
 1. **POOL4,** IMD's ETH/$IMD pool (1%, spacing 60): the volume goes there.
 2. **If POOL4 can't take the trade** (IMD closed it, it's empty, its hook refuses), the **hookless ETH/$IMD pool**
    (1%, spacing 200), which nobody can close. It has about 23x POOL4's liquidity.
@@ -159,7 +162,7 @@ anyone. `AUDIT.md` lists every dependency and what happens if each one fails.
 ## Tests and audit
 
 ```sh
-forge test --offline                                           # 145 tests: local v4 pools, a mock Intake and oracle key
+forge test --offline                                           # 150 tests: local v4 pools, a mock Intake and oracle key
 MAINNET_RPC_URL=<rpc> forge test --match-contract MainnetFork  # 11 more on Ethereum: the real pools, proofs, IMD's Intake
 ```
 

@@ -39,13 +39,26 @@ interface IBurnable {
 /// - Of the $IMD, POOL_SHARE_BPS (6.9%) buys IMD6900 on the IMD6900/$IMD pool, buying pressure, and that IMD6900 is
 ///   burned (its supply shrinks). The rest goes to 0x…dEaD, where nobody can ever move it. If the IMD6900 buy can't
 ///   happen, that share goes to 0x…dEaD too.
-/// @dev No owner, no roles, no upgrades. At most MAX_BURN of ETH is spent per call: small trades aren't worth
-/// sandwiching against these pools' fees.
+/// @dev No owner, no roles, no upgrades. At most MAX_BURN of ETH is spent per call, and of the ETH that was already
+/// waiting here at most MAX_BURN leaves per block, however many calls: small trades aren't worth sandwiching against
+/// these pools' fees, and a batch of calls in one transaction can't make a big one. Royalties a market paid in WETH
+/// are unwrapped on the way. A leg that runs code a third party controls (POOL4's hook; the pair hook and IMD6900)
+/// gets a fixed gas budget: a caller can't starve it, and if it eats the whole budget it is skipped, not fatal.
 contract LARPBurner {
     /// @notice Where $IMD goes: nobody holds this key.
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
-    /// @notice The most ETH one call spends (more waits for the next call).
+    /// @notice The most ETH one call spends, and the most of the ETH that was already waiting here that leaves per
+    /// block (the rest waits for the next block). A caller's own fee, up to this, always goes through.
     uint256 public constant MAX_BURN = 0.1 ether;
+    /// @dev The gas a leg that runs third-party code gets (route 0 through POOL4's hook; the IMD6900 leg through the
+    /// pair hook and IMD6900's proxy): several times the heaviest leg measured (~800k). A caller who can't fund the
+    /// whole budget is refused before the try; a leg that spends all of it fails on its own account and is skipped.
+    uint256 internal constant LEG_GAS = 3_000_000;
+    /// @dev What a call needs after a budgeted leg was refused: the burn to DEAD (or the next route's own check) and
+    /// its events.
+    uint256 internal constant AFTER_GAS = 150_000;
+    /// @dev WETH9 on Ethereum: royalties paid in WETH (offers on Seaport, Blur) are unwrapped and sold with the ETH.
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     /// @notice The share of the $IMD that buys IMD6900 on the IMD6900/$IMD pool, in basis points.
     uint256 public constant POOL_SHARE_BPS = 690;
     /// @dev v4-core TickMath.MIN_SQRT_PRICE + 1 and MAX_SQRT_PRICE - 1: trade as far as the pool goes.
@@ -70,6 +83,10 @@ contract LARPBurner {
     uint24 public immutable PAIR_FEE;
     int24 public immutable PAIR_SPACING;
     address public immutable PAIR_HOOK;
+
+    /// @dev The block in which ETH that was already waiting here was last spent, and how much of it in that block.
+    uint64 internal _burnBlock;
+    uint192 internal _burnedInBlock;
 
     /// @notice `eth` bought `imd` $IMD on route `route` (0 = POOL4, 1 = the hookless pool).
     event Bought(uint256 eth, uint256 imd, uint8 route);
@@ -148,9 +165,26 @@ contract LARPBurner {
     /// @notice Spends the ETH here (with what is sent), up to MAX_BURN, on $IMD (POOL4, else the hookless pool), then
     /// burns all the $IMD here (6.9% through IMD6900). Reverts if the ETH bought less than `minImd`; with no route,
     /// the ETH waits and this reverts only if `minImd` is set.
+    /// @dev What is sent goes first, up to MAX_BURN; the rest of the call's cap comes from the ETH that was already
+    /// waiting here (fees above the cap, royalties, parked fees), of which at most MAX_BURN leaves per block, so a
+    /// batch of calls in one transaction sells no more than one call would. `minImd` is checked against what this
+    /// call bought: with a fee above MAX_BURN, that is the first MAX_BURN of it. Needs a gas limit of about 3.4M
+    /// (LEG_GAS for the POOL4 leg and again for the IMD6900 leg, sequentially); less is refused, never degraded.
     function burn(uint256 minImd) external payable locked returns (uint256 imd) {
-        uint256 eth = address(this).balance;
-        if (eth > MAX_BURN) eth = MAX_BURN;
+        _unwrapWeth();
+        uint256 own = msg.value < MAX_BURN ? msg.value : MAX_BURN;
+        uint256 waiting = address(this).balance - own;
+        if (waiting != 0) {
+            uint256 room = MAX_BURN - own;
+            uint256 spent = _burnBlock == uint64(block.number) ? _burnedInBlock : 0;
+            if (room > MAX_BURN - spent) room = MAX_BURN - spent;
+            if (waiting > room) waiting = room;
+            if (waiting != 0) {
+                _burnBlock = uint64(block.number);
+                _burnedInBlock = uint192(spent + waiting);
+            }
+        }
+        uint256 eth = own + waiting;
         if (eth != 0) {
             for (uint8 route; route < 2; ++route) {
                 (bool ok, bytes memory result) = _tryUnlock(route, eth);
@@ -233,20 +267,44 @@ contract LARPBurner {
         emit Burned(rest, share, burned6900);
     }
 
-    /// @dev One unlock that may fail; a failure that ran out of gas reverts the call instead, so a caller can't skip a
-    /// route (or the IMD6900 buy) by sending too little gas. A genuine revert hands nearly all the gas back. An
-    /// out-of-gas hands back only what the frames above it kept, 1/64 each (EIP-150): about d/64 of the gas when the
-    /// failure is d frames deep. The work runs deep here (unlock, unlockCallback, swap, the hook, the token, a proxy),
-    /// so the line is drawn at a quarter: a try that failed with no more than 1/4 of its gas left ran out of gas,
-    /// anywhere down to 18 frames. A caller who is refused for a real revert after that much work sends more gas.
+    /// @dev One unlock that may fail. A leg is skipped only for a failure of its own, never because the caller sent
+    /// too little gas (a caller can't pick a route, park a fee or skip the IMD6900 buy that way):
+    /// - The legs that run code a third party controls (route 0 through POOL4's hook; the IMD6900 leg through the pair
+    ///   hook and IMD6900, a proxy) run on a fixed budget, LEG_GAS. Unless the call can fund the whole budget it is
+    ///   refused (TooLittleGas) before the try, so the leg gets the same gas whatever the caller sent; a leg that
+    ///   spends all of it (a loop, a hostile upgrade) failed on its own account and is skipped like any other refusal,
+    ///   so no third party can halt the burner.
+    /// - The hookless route runs only the immutable PoolManager and $IMD, so it gets all the gas, and a failure that
+    ///   left no more than 1/4 of it ran out of gas (an out-of-gas d frames deep hands back about d/64, EIP-150; a
+    ///   genuine revert hands back nearly all) and reverts the call.
     function _tryUnlock(uint8 route, uint256 amount) internal returns (bool ok, bytes memory result) {
-        uint256 gasBefore = gasleft();
-        try POOL_MANAGER.unlock(abi.encode(route, amount)) returns (bytes memory r) {
+        bytes memory data = abi.encode(route, amount);
+        if (route == 1) {
+            uint256 gasBefore = gasleft();
+            try POOL_MANAGER.unlock(data) returns (bytes memory r) {
+                return (true, r);
+            } catch {
+                if (gasleft() <= gasBefore / 4) revert TooLittleGas();
+                return (false, "");
+            }
+        }
+        // a call gets at most 63/64 of the gas left (EIP-150): this much is needed for the leg to get all of LEG_GAS
+        if (gasleft() < LEG_GAS + LEG_GAS / 63 + AFTER_GAS) revert TooLittleGas();
+        try POOL_MANAGER.unlock{gas: LEG_GAS}(data) returns (bytes memory r) {
             return (true, r);
         } catch {
-            if (gasleft() <= gasBefore / 4) revert TooLittleGas();
             return (false, "");
         }
+    }
+
+    /// @dev Royalties a market paid in WETH: unwrapped, so they join the ETH and are sold the same way. WETH9's
+    /// `withdraw` pays through `receive`. Where WETH has no code (a test chain) or refuses, nothing happens.
+    function _unwrapWeth() internal {
+        (bool ok, bytes memory r) = WETH.staticcall(abi.encodeWithSelector(0x70a08231, address(this))); // balanceOf
+        if (!ok || r.length < 32) return;
+        uint256 held = abi.decode(r, (uint256));
+        if (held == 0) return;
+        (ok,) = WETH.call(abi.encodeWithSelector(0x2e1a7d4d, held)); // withdraw
     }
 
     /// @dev `eth` in $IMD at a pool's spot price, or 0 if the pool has no price or no liquidity in range.
