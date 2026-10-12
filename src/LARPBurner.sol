@@ -86,18 +86,20 @@ contract LARPBurner {
     error Unfilled();
     error NoPrice();
     error TransferFailed();
+    /// @notice A tick spacing above Uniswap v4's largest (32767).
+    error BadSpacing();
 
     constructor(
         address poolManager,
         address imd,
         uint24 pool4Fee,
-        int24 pool4Spacing,
+        uint24 pool4Spacing,
         address pool4Hook,
         uint24 backupFee,
-        int24 backupSpacing,
+        uint24 backupSpacing,
         address imd6900,
         uint24 pairFee,
-        int24 pairSpacing,
+        uint24 pairSpacing,
         address pairHook
     ) {
         if (poolManager == address(0) || imd == address(0) || imd6900 == address(0)) {
@@ -106,14 +108,21 @@ contract LARPBurner {
         POOL_MANAGER = IPoolManagerLike(poolManager);
         IMD = imd;
         POOL4_FEE = pool4Fee;
-        POOL4_SPACING = pool4Spacing;
+        POOL4_SPACING = _spacing(pool4Spacing);
         POOL4_HOOK = pool4Hook;
         BACKUP_FEE = backupFee;
-        BACKUP_SPACING = backupSpacing;
+        BACKUP_SPACING = _spacing(backupSpacing);
         IMD6900 = imd6900;
         PAIR_FEE = pairFee;
-        PAIR_SPACING = pairSpacing;
+        PAIR_SPACING = _spacing(pairSpacing);
         PAIR_HOOK = pairHook;
+    }
+
+    /// @dev A tick spacing, taken unsigned (deployers' manifests take no signed constructor arguments) and stored as the
+    /// int24 every PoolKey uses. v4's spacings run from 1 to 32767 (TickMath.MAX_TICK_SPACING).
+    function _spacing(uint24 s) private pure returns (int24) {
+        if (s > 32767) revert BadSpacing();
+        return int24(s);
     }
 
     /// @dev One burn at a time: a burn can't run inside a burn.

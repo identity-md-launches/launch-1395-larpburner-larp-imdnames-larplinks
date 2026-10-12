@@ -5,7 +5,7 @@ Scope: `src/` at this commit: `LARPBurner`, `LARP` / `ILARP`, `IMDNames` / `IIMD
 - No owner, no admin, no upgrades.
 - The one role is the names' **artist**, who can change only the art (tokenURI's renderer) and can lock it forever.
 
-**Result: no critical, high or medium findings.** 142 offline tests, plus 11 on an Ethereum fork. Two low findings fixed, each held by a test that fails without the
+**Result: no critical, high or medium findings.** 144 offline tests, plus 11 on an Ethereum fork. Two low findings fixed, each held by a test that fails without the
 fix. The rest acknowledged and documented.
 
 ## Trust: what LARP depends on, and what happens if it fails

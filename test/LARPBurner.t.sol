@@ -51,6 +51,22 @@ contract LARPBurnerTest is Base {
 
     // --- ETH to $IMD ---
 
+    function test_SpacingsAreTakenUnsignedAndKeptAsInt24() public {
+        LARPBurner b = _newBurner(address(pm));
+        assertEq(int256(b.POOL4_SPACING()), 60);
+        assertEq(int256(b.BACKUP_SPACING()), 200);
+        assertEq(int256(b.PAIR_SPACING()), 60);
+    }
+
+    function test_SpacingAboveV4sLargestReverts() public {
+        vm.expectRevert(LARPBurner.BadSpacing.selector);
+        new LARPBurner(address(pm), address(imd), 10_000, 32_768, address(0), 10_000, 200, address(imd6900), 0, 60, address(0));
+        vm.expectRevert(LARPBurner.BadSpacing.selector);
+        new LARPBurner(address(pm), address(imd), 10_000, 60, address(0), 10_000, 200, address(imd6900), 0, type(uint24).max, address(0));
+        LARPBurner ok = new LARPBurner(address(pm), address(imd), 10_000, 32_767, address(0), 10_000, 200, address(imd6900), 0, 60, address(0));
+        assertEq(int256(ok.POOL4_SPACING()), 32_767);
+    }
+
     function test_BuysOnPool4First() public {
         _fillPool4();
         _fillBackup();

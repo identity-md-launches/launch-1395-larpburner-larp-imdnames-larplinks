@@ -26,13 +26,13 @@ contract LaunchTest is Test {
             POOL_MANAGER,
             IMD,
             uint24(10_000),
-            int24(60),
+            uint24(60),
             POOL4_HOOK,
             uint24(10_000),
-            int24(200),
+            uint24(200),
             IMD6900,
             uint24(0),
-            int24(60),
+            uint24(60),
             PAIR_HOOK
         );
     }

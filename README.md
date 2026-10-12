@@ -159,7 +159,7 @@ anyone. `AUDIT.md` lists every dependency and what happens if each one fails.
 ## Tests and audit
 
 ```sh
-forge test --offline                                           # 142 tests: local v4 pools, a mock Intake and oracle key
+forge test --offline                                           # 144 tests: local v4 pools, a mock Intake and oracle key
 MAINNET_RPC_URL=<rpc> forge test --match-contract MainnetFork  # 11 more on Ethereum: the real pools, proofs, IMD's Intake
 ```
 
