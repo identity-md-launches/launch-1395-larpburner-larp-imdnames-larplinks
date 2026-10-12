@@ -6,12 +6,27 @@ import {LARPBurner} from "../src/LARPBurner.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolIdLibrary, PoolKey as V4PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 /// @dev A PoolManager whose swap burns all the gas it is given, as a heavy hook could.
 contract GasHogPoolManager {
     function unlock(bytes calldata) external pure returns (bytes memory) {
         while (true) {}
         return "";
+    }
+}
+
+/// @dev An IMD6900 whose `burn` does about 800k gas of work first: on Ethereum the IMD6900 leg runs the pair hook and
+/// an upgradeable token's burn, three to five frames below the burner, and its cost isn't known in advance.
+contract HeavyIMD6900 is MockIMD6900 {
+    function burn(uint256 amount) external override {
+        bytes32 h;
+        for (uint256 i; i < 5_000; ++i) {
+            h = keccak256(abi.encode(h, i));
+        }
+        _burn(msg.sender, amount);
     }
 }
 
@@ -60,10 +75,26 @@ contract LARPBurnerTest is Base {
 
     function test_SpacingAboveV4sLargestReverts() public {
         vm.expectRevert(LARPBurner.BadSpacing.selector);
-        new LARPBurner(address(pm), address(imd), 10_000, 32_768, address(0), 10_000, 200, address(imd6900), 0, 60, address(0));
+        new LARPBurner(
+            address(pm), address(imd), 10_000, 32_768, address(0), 10_000, 200, address(imd6900), 0, 60, address(0)
+        );
         vm.expectRevert(LARPBurner.BadSpacing.selector);
-        new LARPBurner(address(pm), address(imd), 10_000, 60, address(0), 10_000, 200, address(imd6900), 0, type(uint24).max, address(0));
-        LARPBurner ok = new LARPBurner(address(pm), address(imd), 10_000, 32_767, address(0), 10_000, 200, address(imd6900), 0, 60, address(0));
+        new LARPBurner(
+            address(pm),
+            address(imd),
+            10_000,
+            60,
+            address(0),
+            10_000,
+            200,
+            address(imd6900),
+            0,
+            type(uint24).max,
+            address(0)
+        );
+        LARPBurner ok = new LARPBurner(
+            address(pm), address(imd), 10_000, 32_767, address(0), 10_000, 200, address(imd6900), 0, 60, address(0)
+        );
         assertEq(int256(ok.POOL4_SPACING()), 32_767);
     }
 
@@ -223,6 +254,85 @@ contract LARPBurnerTest is Base {
             }
         }
         assertGt(burned, 0);
+    }
+
+    /// @dev The burner on an IMD6900 whose burn costs ~800k gas, with POOL4 and its pair pool filled.
+    function _heavyBurner() internal returns (LARPBurner heavy, HeavyIMD6900 token) {
+        token = new HeavyIMD6900();
+        bool imdIs0 = address(imd) < address(token);
+        V4PoolKey memory heavyPair = imdIs0
+            ? V4PoolKey(Currency.wrap(address(imd)), Currency.wrap(address(token)), 0, 60, IHooks(address(0)))
+            : V4PoolKey(Currency.wrap(address(token)), Currency.wrap(address(imd)), 0, 60, IHooks(address(0)));
+        pm.initialize(heavyPair, TickMath.getSqrtPriceAtTick(imdIs0 ? int24(92_100) : int24(-92_100)));
+        token.mint(address(this), 1e33);
+        token.approve(address(adder), type(uint256).max);
+        adder.add(heavyPair, 1e23);
+        _fillPool4();
+        heavy = new LARPBurner(
+            address(pm), address(imd), 10_000, 60, address(0), 10_000, 200, address(token), 0, 60, address(0)
+        );
+    }
+
+    /// @dev The audited window: with 1,000,000 gas, POOL4 takes the ETH and the IMD6900 leg runs out of gas three
+    /// frames down. The frames above hand back ~3/64 of the leg's gas, more than the 1/63 the first guard looked for,
+    /// so the leg counted as failed and its share went to DEAD as $IMD. Now the call reverts instead.
+    function test_AnIMD6900LegOutOfGasDeepDownReverts() public {
+        (LARPBurner heavy, HeavyIMD6900 token) = _heavyBurner();
+        uint256 supplyBefore = token.totalSupply();
+        (bool ok, bytes memory err) =
+            address(heavy).call{value: 0.001 ether, gas: 1_000_000}(abi.encodeCall(heavy.burn, (0)));
+        assertFalse(ok, "the starved call went through");
+        assertEq(bytes4(err), LARPBurner.TooLittleGas.selector);
+        assertEq(token.totalSupply(), supplyBefore);
+        assertEq(address(heavy).balance, 0, "the ETH came back with the revert");
+        assertEq(imd.balanceOf(DEAD), 0, "nothing went to DEAD");
+        // with enough gas the same call buys and burns IMD6900
+        heavy.burn{value: 0.001 ether, gas: 5_000_000}(0);
+        assertLt(token.totalSupply(), supplyBefore);
+        assertGt(imd.balanceOf(DEAD), 0);
+    }
+
+    /// @dev Across gas limits from 500k to 2.5M (the audit measured 758k to 1.97M going through with the buy skipped),
+    /// a burn against a heavy IMD6900 leg either buys and burns IMD6900 or reverts: no limit skips the leg.
+    function test_NoGasLimitSkipsAHeavyIMD6900Leg() public {
+        (LARPBurner heavy, HeavyIMD6900 token) = _heavyBurner();
+        uint256 burned;
+        uint256 refused;
+        for (uint256 gas = 500_000; gas <= 2_500_000; gas += 20_000) {
+            uint256 supplyBefore = token.totalSupply();
+            uint256 deadBefore = imd.balanceOf(DEAD);
+            (bool ok, bytes memory err) =
+                address(heavy).call{value: 0.001 ether, gas: gas}(abi.encodeCall(heavy.burn, (0)));
+            if (ok) {
+                ++burned;
+                assertGt(imd.balanceOf(DEAD), deadBefore);
+                assertLt(token.totalSupply(), supplyBefore, "the IMD6900 buy was skipped");
+            } else {
+                ++refused;
+                assertEq(bytes4(err), LARPBurner.TooLittleGas.selector, "a starved burn reverts with TooLittleGas");
+                assertEq(imd.balanceOf(DEAD), deadBefore, "a refused burn moves nothing");
+            }
+        }
+        assertGt(burned, 0, "the sweep reached a gas limit that works");
+        assertGt(refused, 0, "the sweep covered the starved window");
+    }
+
+    /// @dev A genuine revert (an empty pair pool: the swap walks the whole tick range and fills nothing, ~340k gas of
+    /// work before `Unfilled`) hands back everything it didn't use, so with a gas limit of 1M (a quarter of it to
+    /// spare after the leg) it is told apart from an out-of-gas: the share goes to DEAD and the call goes through.
+    /// Below that the same call is refused with TooLittleGas rather than letting the leg's gas decide: the guard
+    /// only ever errs toward refusing.
+    function test_AGenuineFailureIsNotMistakenForTooLittleGas() public {
+        _fillPool4(); // no pair liquidity
+        uint256 deadBefore = imd.balanceOf(DEAD);
+        (bool ok,) = address(burner).call{value: 0.001 ether, gas: 1_000_000}(abi.encodeCall(burner.burn, (0)));
+        assertTrue(ok, "a failed leg that reverted for a real reason is skipped, not refused");
+        assertGt(imd.balanceOf(DEAD), deadBefore);
+        assertEq(imd.balanceOf(address(burner)), 0);
+        bytes memory err;
+        (ok, err) = address(burner).call{value: 0.001 ether, gas: 300_000}(abi.encodeCall(burner.burn, (0)));
+        assertFalse(ok);
+        assertEq(bytes4(err), LARPBurner.TooLittleGas.selector, "too tight to tell: refused, nothing skipped");
     }
 
     function test_NoReentry() public {

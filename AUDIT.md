@@ -5,8 +5,8 @@ Scope: `src/` at this commit: `LARPBurner`, `LARP` / `ILARP`, `IMDNames` / `IIMD
 - No owner, no admin, no upgrades.
 - The one role is the names' **artist**, who can change only the art (tokenURI's renderer) and can lock it forever.
 
-**Result: no critical, high or medium findings.** 144 offline tests, plus 11 on an Ethereum fork. Two low findings fixed, each held by a test that fails without the
-fix. The rest acknowledged and documented.
+**Result: no critical, high or medium findings.** 145 offline tests, plus 11 on an Ethereum fork. Two low findings fixed, each held by a test that fails without the
+fix (L-01's guard was strengthened at the launch audit; see `ADAPTATION.md`). The rest acknowledged and documented.
 
 ## Trust: what LARP depends on, and what happens if it fails
 
@@ -34,11 +34,26 @@ cost: IMD's dashboard won't count these burns as IMD's own.
 Each route's swap runs in a try. A swap that runs out of gas inside it keeps 1/64 of the gas, so a caller who could
 make the swap eat its 63/64 could skip POOL4 for the backup, or park the fee.
 
-**Fix:** a route that fails with no more than 1/63 of its gas left reverts the call (`TooLittleGas`).
+**Fix:** a route that fails with no more than 1/4 of its gas left reverts the call (`TooLittleGas`).
+
+The first version of this fix drew the line at 1/63, which is what is left when the PoolManager itself runs out of
+gas. The launch audit (2026-10-12) showed that is not where the work runs: the swap, the hook, the token transfers and
+IMD6900's `burn` are two to five frames below the burner, and every frame in between keeps 1/64 of its gas and hands
+it back when it reverts, so an out-of-gas that deep left the burner 3/64 to 5/64 of the gas. The 1/63 guard passed,
+the leg counted as failed, and with a heavy IMD6900 leg (~800k gas) every gas limit from ~758k to ~1.97M went through
+with the IMD6900 buy skipped (its share burned as $IMD at `0x…dEaD`). At 1/4 the guard catches an out-of-gas down to
+18 frames, while a genuine revert, which hands back everything it did not use, still passes whenever the caller left a
+quarter to spare. The cost: a call whose leg reverts for a real reason after heavy work (an empty pool whose swap walks
+the whole tick range, ~340k gas) needs a gas limit about a third higher than the work itself (590k instead of 350k for
+an empty pair pool after POOL4); gas used does not change, and a refused call moves nothing.
 **Tests:**
 - `test_ASwapOutOfGasReverts` (a PoolManager that burns all gas) fails without the fix.
 - `test_NoGasLimitSkipsARoute` sweeps gas limits from 100k to 1.5M: the backup pool's price never moves while POOL4
   can take the trade, and no call that goes through skips the IMD6900 buy.
+- `test_AnIMD6900LegOutOfGasDeepDownReverts` (an IMD6900 whose `burn` costs ~800k gas, 1M gas limit) and
+  `test_NoGasLimitSkipsAHeavyIMD6900Leg` (the same, gas limits swept from 500k to 2.5M) fail with the 1/63 guard.
+- `test_AGenuineFailureIsNotMistakenForTooLittleGas`: an empty pair pool's genuine revert is skipped at 1M gas and
+  refused, not skipped, at 300k.
 
 ### L-02 The jeet board's reads grow without bound (LARPLinks)
 
@@ -99,7 +114,8 @@ make the swap eat its 63/64 could skip POOL4 for the backup, or park the fee.
   - **Where it buys:** the IMD6900/$IMD pool, through the real hook's per-trade IMD6900 allowance.
   - **How it burns:** with IMD6900's own `burn`, so the supply drops.
   - **On the fork:** a 0.0069 ETH name fee burned 16,849 IMD6900 and sent 1.81 $IMD to `0x…dEaD`.
-  - **Gas:** across gas limits, no call skips the IMD6900 buy (`test_NoGasLimitSkipsARoute`).
+  - **Gas:** across gas limits, no call skips the IMD6900 buy, even when the leg is heavy and runs out of gas frames
+    below the burner (`test_NoGasLimitSkipsARoute`, `test_NoGasLimitSkipsAHeavyIMD6900Leg`).
 - **The burner's ETH leaves only as a swap.** The sale is exact or nothing; a partial fill reverts the route. $IMD
   goes only to `0x…dEaD`. Only the PoolManager calls back, and only for the burner's own unlock. A transient lock
   refuses a burn inside a burn (`test_NoReentry`).

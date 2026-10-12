@@ -234,13 +234,17 @@ contract LARPBurner {
     }
 
     /// @dev One unlock that may fail; a failure that ran out of gas reverts the call instead, so a caller can't skip a
-    /// route (or the IMD6900 buy) by sending too little gas: the try keeps at most 1/64 of the gas back.
+    /// route (or the IMD6900 buy) by sending too little gas. A genuine revert hands nearly all the gas back. An
+    /// out-of-gas hands back only what the frames above it kept, 1/64 each (EIP-150): about d/64 of the gas when the
+    /// failure is d frames deep. The work runs deep here (unlock, unlockCallback, swap, the hook, the token, a proxy),
+    /// so the line is drawn at a quarter: a try that failed with no more than 1/4 of its gas left ran out of gas,
+    /// anywhere down to 18 frames. A caller who is refused for a real revert after that much work sends more gas.
     function _tryUnlock(uint8 route, uint256 amount) internal returns (bool ok, bytes memory result) {
         uint256 gasBefore = gasleft();
         try POOL_MANAGER.unlock(abi.encode(route, amount)) returns (bytes memory r) {
             return (true, r);
         } catch {
-            if (gasleft() <= gasBefore / 63) revert TooLittleGas();
+            if (gasleft() <= gasBefore / 4) revert TooLittleGas();
             return (false, "");
         }
     }
